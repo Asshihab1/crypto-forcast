@@ -188,3 +188,4 @@ of which platform or bot you use.
 
 This project and its outputs are for educational/informational purposes,
 not financial advice.
+# crypto-forcast
