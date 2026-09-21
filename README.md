@@ -7,6 +7,29 @@ you can make the final call. **It does not place trades for you and it
 does not use Quotex or any binary options platform** — see the "Why not
 Quotex / binary options" note at the bottom for the reasoning.
 
+## Quick start
+
+```bash
+cd crypto-analysis-bot
+python3 -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Then run whichever you want:
+
+```bash
+python dashboard.py           # web dashboard at http://localhost:3100 (recommended)
+python backtester.py          # console backtest — run this first, see Step 1 below
+python bot.py                 # console live-signal loop, no browser
+```
+
+`dashboard.py` is the full experience: real-time chart, live signal, entry
+suggestion, backtest, and Prophet forecast, all in a browser. Needs normal
+outbound internet access to reach the exchange's API (see the note under
+Setup) — won't work in a network-sandboxed environment. Everything below
+explains what each piece does and how to read the output.
+
 ## What's in here
 
 | File | Purpose |
@@ -22,11 +45,6 @@ Quotex / binary options" note at the bottom for the reasoning.
 | `dashboard.py` | Optional web dashboard (Flask + Socket.IO, port 3100) — real-time chart per coin, live signal, on-demand backtest and Prophet forecast, in a browser. |
 
 ## Setup
-
-```bash
-cd crypto-analysis-bot
-pip install -r requirements.txt
-```
 
 Edit `config.py` (or set environment variables) to pick your exchange,
 symbol, and timeframe. Defaults to Binance BTC/USDT on 15-minute candles.
@@ -100,23 +118,40 @@ Serves a browser dashboard at `http://localhost:3100`:
 
 - **Coin picker** — pick from `config.COINS` (BTC, BNB, LTC, ETH, SOL, XRP by
   default; add any pair your exchange lists).
-- **Real-time chart** — candlestick history plus a live price line pushed
-  over a websocket (Socket.IO), updated every `config.REALTIME_POLL_SECONDS`.
+- **One time control** — a single row of tabs (15m/30m/1h/4h/1D/1M/1Y, from
+  `config.TIME_OPTIONS`) drives the chart candle size, RSI/MACD panels, and
+  the forecast horizon together, instead of separate controls per feature.
+- **Real-time chart** — candlestick history, volume, RSI and MACD panels,
+  plus a live price line pushed over a websocket (Socket.IO), updated every
+  `config.REALTIME_POLL_SECONDS`.
 - **Signal panel** — same closed-candle rules-based signal as `bot.py`, per
   coin.
 - **Entry suggestion** — combines the live signal, backtest expectancy, and
-  forecast trend into one ENTRY_LONG / ENTRY_SHORT / AVOID / WAIT verdict,
-  with every input it used spelled out. Only calls an entry when the
-  near-term signal, longer-term forecast, and historical backtest
-  expectancy all agree; disagreement or missing data (backtest/forecast not
-  run yet) falls back to WAIT. Still rules on rules, not a prediction —
-  read the reasons, not just the badge.
-- **Backtest** — runs `backtester.py` for the selected coin on demand.
-- **Forecast** — runs `forecast.py` (Prophet) for day/month/year horizons on
-  demand; plots the projection and uncertainty band on the chart. This is a
-  separate, purely statistical trend extrapolation — it does not feed into
-  the BUY/SELL/HOLD signal above, and per `forecast.py`'s docstring, the
-  widening uncertainty band further out is the honest part of the output.
+  forecast trend into one ENTRY_LONG / ENTRY_SHORT / AVOID / WAIT verdict
+  with an exact entry price, stop, target, and risk/reward margin. Only
+  calls an entry when the near-term signal, matching-horizon forecast, and
+  historical backtest expectancy all agree; disagreement or missing data
+  falls back to WAIT.
+- **Position calculator** — one investment-amount field (top toolbar) sizes
+  the current entry: quantity, live unrealized P&L, and estimated $
+  profit/loss at target/stop.
+- **Backtest** — runs `backtester.py` for the selected coin on demand, with
+  a win/loss donut chart.
+- **Forecast** — runs `forecast.py` (Prophet) for whichever horizon the time
+  tabs are set to; plots the projection and uncertainty band on the chart,
+  projects your investment amount forward at that horizon, and includes a
+  "transparent overview" of exactly what fed the number (history span,
+  candle count, which seasonality components were actually enabled).
+- **Best time to invest** — scans every horizon (15m through 1Y) with
+  Prophet and ranks them by projected move relative to that horizon's own
+  uncertainty band. The top-ranked horizon is a "this trend is large
+  relative to its own noise" signal, not a promise — click any ranked
+  horizon to jump the whole dashboard to it. Runs one Prophet fit per
+  horizon sequentially, so it can take a few minutes.
+
+This is a purely statistical trend extrapolation — it does not feed into
+the BUY/SELL/HOLD signal above, and per `forecast.py`'s docstring, the
+widening uncertainty band further out is the honest part of the output.
 
 Still read-only, no order placement.
 
@@ -188,4 +223,3 @@ of which platform or bot you use.
 
 This project and its outputs are for educational/informational purposes,
 not financial advice.
-# crypto-forcast

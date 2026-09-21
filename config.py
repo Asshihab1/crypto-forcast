@@ -33,11 +33,12 @@ COINS = {
 # ahead ("periods"), the pandas frequency alias for that candle size, and how
 # much history to pull for fitting. Short intraday horizons fit on intraday
 # candles (Prophet has far less signal to work with there — treat these as
-# even less reliable than the daily/month/year horizons); day/month/year fit
-# on daily candles regardless of the live-signal TIMEFRAME above.
+# even less reliable than the longer horizons); month/year fit on daily
+# candles regardless of the chosen chart timeframe.
 FORECAST_HORIZONS = {
     "15m":   {"timeframe": "15m", "periods": 1,   "freq": "15min", "history_candles": 2000},
     "30m":   {"timeframe": "30m", "periods": 1,   "freq": "30min", "history_candles": 2000},
+    "1h":    {"timeframe": "1h",  "periods": 1,   "freq": "h",     "history_candles": 2000},
     "4h":    {"timeframe": "4h",  "periods": 1,   "freq": "4h",    "history_candles": 1000},
     "day":   {"timeframe": "1d",  "periods": 1,   "freq": "D",     "history_candles": 730},
     "month": {"timeframe": "1d",  "periods": 30,  "freq": "D",     "history_candles": 730},
@@ -51,8 +52,20 @@ ATR_STOP_MULT = 1.5
 ATR_TARGET_MULT = 3.0   # 2:1 reward:risk at these defaults
 
 # --- Dashboard chart ---------------------------------------------------------
-CHART_TIMEFRAME = "1h"          # default candle size for the live dashboard chart
-CHART_TIMEFRAMES = ["15m", "30m", "1h", "4h", "1d"]   # selectable in the dashboard
+# One unified time control drives the chart timeframe, indicators, and the
+# forecast horizon at once — key -> (label, candle timeframe, forecast
+# horizon key). Binance has no native 45m candle, so the ladder below is the
+# closest increasing sequence it actually supports.
+CHART_TIMEFRAME = "15m"         # default candle size for the live dashboard chart
+TIME_OPTIONS = [
+    {"key": "15m", "label": "15m", "timeframe": "15m", "horizon": "15m"},
+    {"key": "30m", "label": "30m", "timeframe": "30m", "horizon": "30m"},
+    {"key": "1h",  "label": "1h",  "timeframe": "1h",  "horizon": "1h"},
+    {"key": "4h",  "label": "4h",  "timeframe": "4h",  "horizon": "4h"},
+    {"key": "1d",  "label": "1D",  "timeframe": "1d",  "horizon": "day"},
+    {"key": "1mo", "label": "1M",  "timeframe": "1d",  "horizon": "month"},
+    {"key": "1y",  "label": "1Y",  "timeframe": "1d",  "horizon": "year"},
+]
 CHART_HISTORY_LIMIT = 300       # candles to load for the initial chart draw
 REALTIME_POLL_SECONDS = 5       # how often the dashboard pushes live price ticks
 

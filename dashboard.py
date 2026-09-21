@@ -86,7 +86,15 @@ def _realtime_price_loop():
                 ticker = exchange.fetch_ticker(symbol)
                 price = ticker.get("last") or ticker.get("close")
                 if price is not None:
-                    socketio.emit("price", {"symbol": symbol, "price": float(price), "ts": time.time()})
+                    socketio.emit("price", {
+                        "symbol": symbol,
+                        "price": float(price),
+                        "ts": time.time(),
+                        "change_pct": ticker.get("percentage"),
+                        "high": ticker.get("high"),
+                        "low": ticker.get("low"),
+                        "quote_volume": ticker.get("quoteVolume"),
+                    })
             except Exception:
                 traceback.print_exc()
         time.sleep(config.REALTIME_POLL_SECONDS)
@@ -140,7 +148,7 @@ def _compute_entry_verdict(symbol: str) -> dict:
         sig_entry = _signals.get(symbol)
         bt_entry = _backtest_cache.get(symbol, {}).get("result")
         fc_entry = None
-        for h in ("15m", "30m", "4h", "day", "month", "year"):
+        for h in ("15m", "30m", "1h", "4h", "day", "month", "year"):
             cached = _forecast_cache.get(f"{symbol}|{h}")
             if cached and not cached.get("running") and cached.get("result") and "error" not in cached["result"]:
                 fc_entry = cached["result"]
@@ -235,6 +243,60 @@ def _run_forecast_async(symbol: str, horizon: str):
     threading.Thread(target=work, daemon=True).start()
 
 
+_best_time_cache: dict[str, dict] = {}   # symbol -> {"running": bool, "result": ...}
+
+
+def _run_best_time_async(symbol: str):
+    """
+    Scan every configured forecast horizon for `symbol` and rank them by
+    signal-to-noise: |projected move| divided by the forecast's own
+    uncertainty band. This is still just Prophet's trend extrapolation
+    repeated at different candle sizes — a high ratio means "this horizon's
+    trend is large relative to how wide its own uncertainty is," not
+    "this will happen." Ties/no-signal horizons rank low on purpose.
+    """
+    def work():
+        try:
+            ranked = []
+            for horizon in config.FORECAST_HORIZONS:
+                try:
+                    fc = run_forecast(symbol, horizon)
+                except Exception as exc:
+                    ranked.append({"horizon": horizon, "error": str(exc)})
+                    continue
+                band = fc["fit_details"]["uncertainty_band_pct_of_price"] / 2.0
+                score = abs(fc["projected_change_pct"]) / max(band, 0.01)
+                ranked.append({
+                    "horizon": horizon,
+                    "timeframe": fc["timeframe"],
+                    "projected_change_pct": fc["projected_change_pct"],
+                    "uncertainty_band_pct": band,
+                    "score": score,
+                })
+                with _lock:
+                    _forecast_cache[f"{symbol}|{horizon}"] = {"running": False, "result": fc}
+
+            valid = [r for r in ranked if "error" not in r]
+            valid.sort(key=lambda r: r["score"], reverse=True)
+            best = valid[0] if valid else None
+
+            with _lock:
+                _best_time_cache[symbol] = {
+                    "running": False,
+                    "result": {"ranked": valid, "best": best, "errors": [r for r in ranked if "error" in r]},
+                }
+        except Exception as exc:
+            traceback.print_exc()
+            with _lock:
+                _best_time_cache[symbol] = {"running": False, "result": {"error": str(exc)}}
+
+    with _lock:
+        if _best_time_cache.get(symbol, {}).get("running"):
+            return
+        _best_time_cache[symbol] = {"running": True, "result": _best_time_cache.get(symbol, {}).get("result")}
+    threading.Thread(target=work, daemon=True).start()
+
+
 _PAGE = """
 <!doctype html>
 <html>
@@ -243,186 +305,354 @@ _PAGE = """
   <title>Crypto Analysis Bot</title>
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
   <style>
-    :root { color-scheme: dark; }
+    :root {
+      color-scheme: light;
+      /* SAP Fiori (Quartz Light) design tokens */
+      --bg:#f2f2f2; --card:#ffffff; --border:#d9d9d9; --border-soft:#e5e5e5;
+      --text:#32363a; --text-muted:#6a6d70; --text-faint:#89919a;
+      --accent:#0a6ed1; --accent-soft:#e6f2fd; --accent-dark:#0854a0;
+      --pos:#107e3e; --pos-soft:#e5f5ea; --neg:#bb0000; --neg-soft:#ffebeb;
+      --amber:#e9730c; --amber-soft:#fef3e6;
+      --shell-bg:#354a5f; --shell-text:#ffffff;
+      --sidebar-w:180px; --radius:4px; --radius-lg:8px;
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      /* SAP Fiori (Quartz Dark) design tokens */
+      --bg:#12181f; --card:#1a232c; --border:#3b4a59; --border-soft:#2b3947;
+      --text:#ffffff; --text-muted:#a6b7c4; --text-faint:#7b8fa0;
+      --accent:#4a9eff; --accent-soft:#1c2e40; --accent-dark:#7cbaff;
+      --pos:#4ecb73; --pos-soft:#16281c; --neg:#ff5c5c; --neg-soft:#301616;
+      --amber:#f0a35d; --amber-soft:#2e2213;
+      --shell-bg:#1a232c; --shell-text:#ffffff;
+    }
     * { box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background:#0b0e14; color:#e6e6e6; padding:1.5rem 2rem; width:100%;
+    html, body {
+      font-family: "72", "72full", Arial, Helvetica, sans-serif;
+      background:var(--bg); color:var(--text); margin:0; width:100%; height:100%; overflow:hidden;
+      font-size:14px;
     }
-    .layout { display:grid; grid-template-columns: minmax(0, 2.2fr) minmax(280px, 1fr); gap:1.25rem; align-items:start; }
-    @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
-    .col { min-width:0; }
-    h1 { font-size:1.25rem; font-weight:600; color:#e6e6e6; margin-bottom:1.25rem; }
-    .buy { color:#3ddc84; } .sell { color:#ff5c5c; } .hold { color:#c9c9c9; }
-    .card {
-      background:#12161f; border:1px solid #232838; border-radius:12px;
-      padding:1.25rem 1.5rem; margin-bottom:1.25rem;
+    .shellbar {
+      height:44px; flex-shrink:0; background:var(--shell-bg); color:var(--shell-text);
+      display:flex; align-items:center; justify-content:space-between; padding:0 1rem;
     }
-    .card h2 { margin:0 0 0.25rem 0; font-size:1.4rem; }
-    .meta { color:#7d8797; font-size:0.85rem; margin-bottom:0.75rem; }
-    ul.reasons { margin:0; padding-left:1.1rem; }
-    ul.reasons li { margin:0.3rem 0; font-size:0.92rem; color:#c3cad6; }
-    .updated { color:#5a6472; font-size:0.78rem; margin-top:0.9rem; }
+    .shellbar-left { display:flex; align-items:center; gap:0.6rem; font-size:0.95rem; font-weight:600; }
+    .shellbar-icon { width:26px; height:26px; border-radius:50%; background:rgba(255,255,255,0.15); display:flex; align-items:center; justify-content:center; font-size:0.8rem; }
+    .shellbar-right { display:flex; align-items:center; gap:0.9rem; }
+    .shellbar .live-pill { background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2); color:#fff; }
+    .theme-switch-btn {
+      background:rgba(255,255,255,0.12); border:1px solid rgba(255,255,255,0.25); color:#fff;
+      border-radius:var(--radius); padding:0.3rem 0.6rem; font-size:0.78rem; cursor:pointer;
+    }
+    .app-shell { display:flex; height:calc(100vh - 44px); }
+    .sidebar {
+      width:var(--sidebar-w); flex-shrink:0; background:var(--card); border-right:1px solid var(--border);
+      padding:1.25rem 1rem; height:100vh; display:flex; flex-direction:column;
+    }
+    .side-nav { display:flex; flex-direction:column; gap:0.15rem; }
+    .nav-item {
+      display:block; padding:0.5rem 0.75rem; border-radius:var(--radius); color:var(--text-muted);
+      text-decoration:none; font-size:0.88rem; font-weight:500;
+    }
+    .nav-item:hover { background:var(--accent-soft); color:var(--accent-dark); }
+    .nav-item.active { background:var(--accent); color:#fff; }
+
+    .main { flex:1; min-width:0; height:100vh; display:flex; flex-direction:column; padding:1rem 1.5rem; overflow:hidden; }
+    .topbar { flex-shrink:0; display:flex; align-items:center; justify-content:space-between; margin-bottom:0.75rem; }
+    .crumbs { font-size:0.95rem; color:var(--text-muted); }
+    .crumbs b { color:var(--text); }
+    .live-pill { display:flex; align-items:center; justify-content:center; width:28px; height:28px; background:var(--card); border:1px solid var(--border); border-radius:50%; }
+    .live-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--pos); }
+    .live-dot.off { background:var(--text-faint); }
+
+    .stats-row { flex-shrink:0; display:grid; grid-template-columns: 1.3fr repeat(3, 1fr); gap:0.75rem; margin-bottom:0.75rem; }
+    .balance-card {
+      background:linear-gradient(135deg, var(--accent), var(--accent-dark)); color:#fff;
+      border-radius:var(--radius-lg); padding:0.8rem 1.1rem;
+    }
+    .balance-card .label { font-size:0.76rem; opacity:0.85; margin-bottom:0.25rem; }
+    .balance-card input {
+      width:100%; background:rgba(255,255,255,0.15); border:1px solid rgba(255,255,255,0.3); color:#fff;
+      padding:0.4rem 0.6rem; border-radius:var(--radius); font-size:0.92rem; margin-bottom:0.4rem;
+    }
+    .balance-card input::placeholder { color:rgba(255,255,255,0.7); }
+    .balance-summary { font-size:0.78rem; opacity:0.95; display:flex; flex-direction:column; gap:0.15rem; }
+    .mini-coin { background:var(--card); border:1px solid var(--border); border-radius:var(--radius-lg); padding:0.7rem 0.9rem; cursor:pointer; }
+    .mini-coin:hover { border-color:var(--accent); }
+    .mini-coin .row { display:flex; align-items:center; justify-content:space-between; margin-bottom:0.35rem; }
+    .mini-coin .name { font-weight:600; font-size:0.82rem; }
+    .mini-coin .pair { font-size:0.7rem; color:var(--text-faint); }
+    .mini-coin .price { font-size:1rem; font-weight:700; }
+    .coin-badge { width:24px; height:24px; border-radius:50%; background:var(--accent-soft); color:var(--accent-dark); display:flex; align-items:center; justify-content:center; font-size:0.72rem; font-weight:700; }
+
+    .content-grid { flex:1; min-height:0; display:grid; grid-template-columns: minmax(0, 2.1fr) minmax(280px, 1fr); gap:1rem; }
+
+    .card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius-lg); padding:1rem 1.2rem; }
+    .section-title { font-size:0.92rem; font-weight:600; color:var(--text); margin-bottom:0.75rem; }
+    .meta { color:var(--text-muted); font-size:0.85rem; margin-bottom:0.75rem; }
+    .placeholder { color:var(--text-faint); font-size:0.9rem; }
+    @keyframes skeleton-shimmer { 0% { background-position:-200px 0; } 100% { background-position:200px 0; } }
+    .skel {
+      display:block; border-radius:var(--radius); background:var(--border-soft);
+      background-image:linear-gradient(90deg, var(--border-soft) 0px, var(--border) 40px, var(--border-soft) 80px);
+      background-size:200px 100%; background-repeat:no-repeat; animation:skeleton-shimmer 1.2s infinite linear;
+    }
+    .skel-line { height:0.85rem; margin-bottom:0.5rem; width:100%; }
+    .skel-line.short { width:40%; }
+    .skel-line.medium { width:65%; }
+    .skel-block { height:2.5rem; }
+    .skel-row { display:flex; align-items:center; gap:0.6rem; padding:0.5rem 0; }
+    .skel-circle { width:24px; height:24px; border-radius:50%; flex-shrink:0; }
+    .updated { color:var(--text-faint); font-size:0.78rem; margin-top:0.9rem; }
+
+    .chart-card { display:flex; flex-direction:column; min-height:0; }
+    .chart-head { flex-shrink:0; display:flex; flex-wrap:wrap; align-items:flex-start; justify-content:space-between; gap:1rem; margin-bottom:0.5rem; }
+    .chart-title-row { display:flex; align-items:center; gap:0.6rem; margin-bottom:0.2rem; }
+    .chart-price-big { font-size:1.4rem; font-weight:700; }
+    .chart-substats { display:flex; gap:1.1rem; font-size:0.78rem; color:var(--text-muted); flex-wrap:wrap; }
+    .chart-substats b { color:var(--text); }
+    #rsi-chart { flex:1; min-height:0; }
+    #macd-chart { flex:1; min-height:0; }
+
+    .side-panel { display:flex; flex-direction:column; min-height:0; padding-bottom:0.5rem; }
+    .side-tabs { flex-shrink:0; display:flex; flex-wrap:wrap; gap:0; margin-bottom:0.75rem; border-bottom:1px solid var(--border); }
+    .side-tab {
+      background:transparent; border:none; border-bottom:2px solid transparent; color:var(--text-muted);
+      padding:0.5rem 0.65rem; border-radius:0; font-size:0.76rem; font-weight:400; margin-bottom:-1px;
+    }
+    .side-tab:hover { color:var(--text); background:var(--bg); }
+    .side-tab.active { background:transparent; border-bottom-color:var(--accent); color:var(--accent); font-weight:600; }
+    .tab-content { flex:1; min-height:0; overflow-y:auto; }
+    .tab-panel { display:none; }
+    .tab-panel.active { display:block; }
+    #chart { width:100%; height:340px; }
+
+    select, button, input {
+      background:var(--card); color:var(--text); border:1px solid var(--border); padding:0.55rem 0.85rem;
+      border-radius:var(--radius); font-size:0.88rem; font-weight:400; cursor:pointer; font-family:inherit;
+    }
+    button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+    button:disabled { background:var(--border-soft); color:var(--text-faint); cursor:default; }
     .toolbar { display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap; margin-bottom:1rem; }
-    select, button {
-      background:#1a1f2b; color:#e6e6e6; border:1px solid #2d3340; padding:0.55rem 0.9rem;
-      border-radius:8px; font-size:0.9rem; font-weight:500; cursor:pointer;
-    }
-    button.primary { background:#238636; border-color:#238636; color:white; }
-    button:disabled { background:#2d3340; color:#7d8797; cursor:default; }
-    .live-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3ddc84; margin-right:0.4rem; }
-    .live-dot.off { background:#5a6472; }
-    #chart { width:100%; height:380px; }
-    .section-title { font-size:0.95rem; font-weight:600; color:#c3cad6; margin-bottom:0.9rem; }
-    .stat-grid {
-      display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));
-      gap:0.75rem; margin-top:1rem;
-    }
-    .stat {
-      background:#0e131c; border:1px solid #1f2432; border-radius:10px; padding:0.85rem 1rem;
-    }
-    .stat .label { font-size:0.78rem; color:#8891a0; margin-bottom:0.35rem; }
-    .stat .value { font-size:1.25rem; font-weight:600; }
-    .pos { color:#3ddc84; } .neg { color:#ff5c5c; } .neutral { color:#e6e6e6; }
-    .verdict {
-      margin-top:1rem; padding:0.75rem 1rem; border-radius:8px; font-size:0.88rem;
-      background:#1a1512; border:1px solid #3d2f1a; color:#e0b96b;
-    }
-    .verdict.good { background:#11201a; border-color:#1e3d2f; color:#5fd99a; }
-    .placeholder { color:#5a6472; font-size:0.9rem; }
-    .overview { margin-top:1rem; border:1px solid #232838; border-radius:10px; overflow:hidden; }
-    .overview summary {
-      cursor:pointer; padding:0.7rem 1rem; font-size:0.82rem; color:#9aa4b2;
-      background:#0e131c; list-style:none; user-select:none;
-    }
+    .tf-tabs { display:inline-flex; gap:0.25rem; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius); padding:0.15rem; }
+    .tf-tab { background:transparent; border:none; padding:0.35rem 0.7rem; border-radius:2px; font-size:0.8rem; font-weight:400; color:var(--text-muted); }
+    .tf-tab:hover { color:var(--text); background:var(--border-soft); }
+    .tf-tab.active { background:var(--accent); color:#fff; font-weight:600; }
+
+    .buy, .pos { color:var(--pos); } .sell, .neg { color:var(--neg); } .hold, .neutral { color:var(--text); }
+    ul.reasons { margin:0; padding-left:1.1rem; }
+    ul.reasons li { margin:0.3rem 0; font-size:0.92rem; color:var(--text-muted); }
+
+    .stat-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:0.75rem; margin-top:1rem; }
+    .stat { background:var(--bg); border:1px solid var(--border-soft); border-radius:var(--radius); padding:0.85rem 1rem; }
+    .stat .label { font-size:0.78rem; color:var(--text-muted); margin-bottom:0.35rem; }
+    .stat .value { font-size:1.2rem; font-weight:600; }
+
+    .verdict { margin-top:1rem; padding:0.6rem 0.9rem; border-radius:0 var(--radius) var(--radius) 0; border-left:3px solid var(--amber); font-size:0.85rem; background:var(--amber-soft); color:var(--text); }
+    .verdict.good { background:var(--pos-soft); border-left-color:var(--pos); }
+
+    .overview { margin-top:1rem; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
+    .overview summary { cursor:pointer; padding:0.7rem 1rem; font-size:0.82rem; color:var(--text-muted); background:var(--bg); list-style:none; user-select:none; }
     .overview summary::-webkit-details-marker { display:none; }
     .overview summary::before { content:'\\25B8  '; }
     .overview[open] summary::before { content:'\\25BE  '; }
-    .overview-body { padding:0.9rem 1rem; font-size:0.83rem; color:#c3cad6; }
-    .overview-row { display:flex; justify-content:space-between; padding:0.3rem 0; border-bottom:1px solid #1c2130; }
+    .overview-body { padding:0.9rem 1rem; font-size:0.83rem; color:var(--text-muted); }
+    .overview-row { display:flex; justify-content:space-between; padding:0.3rem 0; border-bottom:1px solid var(--border-soft); }
     .overview-row:last-child { border-bottom:none; }
-    .overview-row .k { color:#7d8797; }
+    .overview-row .k { color:var(--text-faint); }
     .seasonality-tag { display:inline-block; padding:0.15rem 0.5rem; border-radius:4px; font-size:0.72rem; margin-left:0.3rem; }
-    .seasonality-tag.on { background:#1e3d2f; color:#5fd99a; }
-    .seasonality-tag.off { background:#232838; color:#5a6472; }
+    .seasonality-tag.on { background:var(--pos-soft); color:var(--pos); }
+    .seasonality-tag.off { background:var(--border-soft); color:var(--text-faint); }
+
     .entry-card { border-width:2px; }
-    .entry-card.entry-long { border-color:#1e3d2f; background:#0f1a15; }
-    .entry-card.entry-short { border-color:#3d1f1f; background:#1a1212; }
-    .entry-card.entry-avoid { border-color:#3d1f1f; background:#1a1212; }
-    .entry-card.entry-wait { border-color:#2d3340; }
+    .entry-card.entry-long { border-color:#bfe9cf; background:var(--pos-soft); }
+    .entry-card.entry-short { border-color:#f6c6c6; background:var(--neg-soft); }
+    .entry-card.entry-avoid { border-color:#f6c6c6; background:var(--neg-soft); }
+    .entry-card.entry-wait { border-color:var(--border); }
     .entry-badge { display:inline-block; padding:0.3rem 0.8rem; border-radius:6px; font-weight:700; font-size:1rem; }
-    .entry-badge.entry-long { background:#1e3d2f; color:#5fd99a; }
-    .entry-badge.entry-short { background:#3d1f1f; color:#ff8f8f; }
-    .entry-badge.entry-avoid { background:#3d1f1f; color:#ff8f8f; }
-    .entry-badge.entry-wait { background:#2d3340; color:#c3cad6; }
-    .entry-card ul { margin:0.75rem 0 0 1.1rem; padding:0; }
-    .entry-card li { margin:0.3rem 0; font-size:0.9rem; color:#c3cad6; }
-    .disclaimer { color:#5a6472; font-size:0.75rem; margin-top:0.9rem; }
-    .entry-segments {
-      display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));
-      gap:0.75rem; margin:0.9rem 0;
-    }
-    .segment { background:#0e131c; border:1px solid #1f2432; border-radius:10px; padding:0.85rem 1rem; }
-    .segment .label { font-size:0.78rem; color:#8891a0; margin-bottom:0.35rem; }
+    .entry-badge.entry-long { background:var(--pos); color:#fff; }
+    .entry-badge.entry-short { background:var(--neg); color:#fff; }
+    .entry-badge.entry-avoid { background:var(--neg); color:#fff; }
+    .entry-badge.entry-wait { background:var(--text-faint); color:#fff; }
+    .entry-segments { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:0.75rem; margin:0.9rem 0; }
+    .segment { background:var(--card); border:1px solid var(--border-soft); border-radius:var(--radius); padding:0.85rem 1rem; }
+    .segment .label { font-size:0.78rem; color:var(--text-muted); margin-bottom:0.35rem; }
     .segment .value { font-size:1.15rem; font-weight:600; }
-    .dir-up { color:#3ddc84; } .dir-down { color:#ff5c5c; } .dir-flat { color:#c9c9c9; }
+    .dir-up { color:var(--pos); } .dir-down { color:var(--neg); } .dir-flat { color:var(--text-muted); }
+
+    table.markets-table { width:100%; border-collapse:collapse; font-size:0.85rem; }
+    table.markets-table th { text-align:left; color:var(--text-faint); font-weight:500; font-size:0.75rem; padding:0.4rem 0.6rem; border-bottom:1px solid var(--border); }
+    table.markets-table td { padding:0.65rem 0.6rem; border-bottom:1px solid var(--border-soft); }
+    table.markets-table tr.mkt-row { cursor:pointer; }
+    table.markets-table tr.mkt-row:hover { background:var(--bg); }
+    table.markets-table tr.mkt-row.active { background:var(--accent-soft); }
   </style>
 </head>
 <body>
-  <h1><span class="live-dot off" id="live-dot"></span>Crypto Analysis Bot &middot; {{ exchange }}</h1>
-
-  <div class="toolbar">
-    <select id="coin-select">
-      {% for symbol, label in coins.items() %}
-      <option value="{{ symbol }}">{{ label }} ({{ symbol }})</option>
-      {% endfor %}
-    </select>
-    <select id="tf-select">
-      {% for tf in chart_timeframes %}
-      <option value="{{ tf }}" {% if tf == default_timeframe %}selected{% endif %}>{{ tf }}</option>
-      {% endfor %}
-    </select>
-    <input id="amount-input" type="number" min="0" step="any" placeholder="Investment amount ($)" style="width:180px">
-    <span id="last-price" class="meta"></span>
+  <div class="shellbar">
+    <div class="shellbar-left">
+      <span class="shellbar-icon">₿</span>
+      {{ exchange|capitalize }} Analysis Bot
+    </div>
+    <div class="shellbar-right">
+      <div class="live-pill" id="live-pill" title="Connecting"><span class="live-dot off" id="live-dot"></span></div>
+      <button type="button" class="theme-switch-btn" id="theme-toggle-btn">Dark mode</button>
+    </div>
   </div>
 
-  <div class="layout">
-    <div class="col">
-      <div class="card">
-        <div id="chart"></div>
-        <div id="rsi-chart" style="margin-top:0.4rem"></div>
-        <div id="macd-chart" style="margin-top:0.4rem"></div>
-      </div>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <nav class="side-nav">
+        <a href="#dashboard" class="nav-item active">Dashboard</a>
+      </nav>
+    </aside>
 
-      <div class="card entry-card" id="entry-card"><span class="placeholder">Loading...</span></div>
+    <main class="main">
+      <header class="topbar">
+        <div class="crumbs">Dashboard <span>/</span> <b id="crumb-coin">{{ exchange }}</b></div>
+      </header>
 
-      <div class="card">
-        <div class="section-title">Position calculator</div>
-        <div id="position-out"><span class="placeholder">Enter an amount above to size the current entry.</span></div>
-      </div>
-
-      <div class="card">
-        <div class="section-title">Backtest outcome</div>
-        <div id="backtest-donut-wrap"><span class="placeholder">Run a backtest to see the win/loss split.</span></div>
-      </div>
-    </div>
-
-    <div class="col">
-      <div class="card" id="signal-card"><span class="placeholder">Loading signal...</span></div>
-
-      <div class="card">
-        <div class="section-title">Prophet forecast</div>
-        <div class="toolbar">
-          <select id="horizon-select">
-            {% for key in horizons %}
-            <option value="{{ key }}">{{ key }}</option>
-            {% endfor %}
-          </select>
-          <button class="primary" id="forecast-btn" onclick="runForecast()">Run forecast</button>
+      <section class="stats-row">
+        <div class="balance-card">
+          <div class="label">Investment amount</div>
+          <input id="amount-input" type="number" min="0" step="any" placeholder="$0.00">
+          <div class="balance-summary" id="position-summary">Enter an amount to size the current entry.</div>
         </div>
-        <div id="forecast-out"></div>
-      </div>
+        <div class="mini-coin" id="mini-coin-0"></div>
+        <div class="mini-coin" id="mini-coin-1"></div>
+        <div class="mini-coin" id="mini-coin-2"></div>
+      </section>
 
-      <div class="card">
-        <div class="section-title">Backtest</div>
-        <button id="bt-btn" onclick="runBacktest()">Run backtest ({{ backtest_candles }} candles)</button>
-        <div id="backtest-out"></div>
-      </div>
-    </div>
+      <section class="content-grid" id="dashboard">
+        <div class="card chart-card">
+          <div class="chart-head">
+            <div>
+              <div class="chart-title-row">
+                <select id="coin-select">
+                  {% for symbol, label in coins.items() %}
+                  <option value="{{ symbol }}">{{ label }} ({{ symbol }})</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="chart-price-big" id="chart-price-big">—</div>
+              <div class="chart-substats">
+                <span>24h <b id="stat-change">—</b></span>
+                <span>High 24h <b id="stat-high">—</b></span>
+                <span>Low 24h <b id="stat-low">—</b></span>
+                <span>Volume 24h <b id="stat-vol">—</b></span>
+              </div>
+            </div>
+            <div class="tf-tabs" id="tf-tabs">
+              {% for opt in time_options %}
+              <button type="button" class="tf-tab{% if opt.key == default_time_key %} active{% endif %}" data-key="{{ opt.key }}">{{ opt.label }}</button>
+              {% endfor %}
+            </div>
+          </div>
+          <div style="position:relative; flex:3; min-height:0; display:flex;">
+            <div id="chart" style="flex:1"></div>
+            <div id="chart-skel" class="skel" style="position:absolute; inset:0; border-radius:0;"></div>
+          </div>
+          <div id="rsi-chart"></div>
+          <div id="macd-chart"></div>
+        </div>
+
+        <div class="card side-panel">
+          <div class="side-tabs" id="side-tabs">
+            <button type="button" class="side-tab active" data-tab="entry">Entry</button>
+            <button type="button" class="side-tab" data-tab="signal">Signal</button>
+            <button type="button" class="side-tab" data-tab="position">Position</button>
+            <button type="button" class="side-tab" data-tab="forecast">Forecast</button>
+            <button type="button" class="side-tab" data-tab="besttime">Best time</button>
+            <button type="button" class="side-tab" data-tab="backtest">Backtest</button>
+            <button type="button" class="side-tab" data-tab="markets">Markets</button>
+          </div>
+          <div class="tab-content">
+            <div class="tab-panel active" data-panel="entry">
+              <div id="entry-card">
+                <span class="skel skel-line short" style="height:1.4rem;margin-bottom:0.75rem"></span>
+                <span class="skel skel-line"></span>
+                <span class="skel skel-line medium"></span>
+              </div>
+            </div>
+            <div class="tab-panel" data-panel="signal">
+              <div id="signal-card">
+                <span class="skel skel-line short" style="height:1.4rem;margin-bottom:0.75rem"></span>
+                <span class="skel skel-line"></span>
+                <span class="skel skel-line medium"></span>
+              </div>
+            </div>
+            <div class="tab-panel" data-panel="position">
+              <div class="section-title">Position calculator</div>
+              <div id="position-out"><span class="placeholder">Enter an amount above to size the current entry.</span></div>
+            </div>
+            <div class="tab-panel" data-panel="forecast">
+              <div class="section-title">Prophet forecast</div>
+              <div class="toolbar">
+                <span class="meta">Horizon: <b id="forecast-horizon-label">—</b></span>
+                <button class="primary" id="forecast-btn" onclick="runForecast()">Run forecast</button>
+              </div>
+              <div id="forecast-out"></div>
+            </div>
+            <div class="tab-panel" data-panel="besttime">
+              <div class="section-title">Best time to invest</div>
+              <div class="toolbar">
+                <button class="primary" id="best-time-btn" onclick="runBestTime()">Scan all horizons</button>
+              </div>
+              <div id="best-time-out"><span class="placeholder">Scans 15m/30m/1h/4h/1D/1M/1Y and ranks each by projected move vs its own uncertainty. Runs a Prophet fit per horizon — can take a few minutes.</span></div>
+            </div>
+            <div class="tab-panel" data-panel="backtest">
+              <div class="section-title">Backtest</div>
+              <button id="bt-btn" onclick="runBacktest()">Run backtest ({{ backtest_candles }} candles)</button>
+              <div id="backtest-out"></div>
+              <div id="backtest-donut-wrap" style="margin-top:0.75rem"></div>
+            </div>
+            <div class="tab-panel" data-panel="markets">
+              <div class="section-title">Markets</div>
+              <table class="markets-table">
+                <thead><tr><th>Asset</th><th>Price</th><th>24h change</th></tr></thead>
+                <tbody id="markets-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
   </div>
 
   <script>
     const COINS = {{ coins_json|safe }};
+    const TIME_OPTIONS = {{ time_options_json|safe }};
     let currentSymbol = document.getElementById('coin-select').value;
-    let currentTimeframe = document.getElementById('tf-select').value;
+    let currentTimeOpt = TIME_OPTIONS.find(o => o.key === '{{ default_time_key }}') || TIME_OPTIONS[0];
+    let currentTimeframe = currentTimeOpt.timeframe;
     const chartEl = document.getElementById('chart');
     const chart = LightweightCharts.createChart(chartEl, {
-      layout: { background: { color: '#12161f' }, textColor: '#c3cad6' },
-      grid: { vertLines: { color: '#1c2130' }, horzLines: { color: '#1c2130' } },
-      rightPriceScale: { borderColor: '#232838' },
-      timeScale: { borderColor: '#232838', timeVisible: true },
-      height: 380,
+      layout: { background: { color: '#ffffff' }, textColor: '#6b7280' },
+      grid: { vertLines: { color: '#eef0f5' }, horzLines: { color: '#eef0f5' } },
+      rightPriceScale: { borderColor: '#e8eaf1' },
+      timeScale: { borderColor: '#e8eaf1', timeVisible: true },
+      autoSize: true,
     });
 
     const rsiChart = LightweightCharts.createChart(document.getElementById('rsi-chart'), {
-      layout: { background: { color: '#12161f' }, textColor: '#c3cad6' },
-      grid: { vertLines: { color: '#1c2130' }, horzLines: { color: '#1c2130' } },
-      rightPriceScale: { borderColor: '#232838' },
-      timeScale: { borderColor: '#232838', timeVisible: true, visible: false },
-      height: 120,
+      layout: { background: { color: '#ffffff' }, textColor: '#6b7280' },
+      grid: { vertLines: { color: '#eef0f5' }, horzLines: { color: '#eef0f5' } },
+      rightPriceScale: { borderColor: '#e8eaf1' },
+      timeScale: { borderColor: '#e8eaf1', timeVisible: true, visible: false },
+      autoSize: true,
     });
-    const rsiSeries = rsiChart.addLineSeries({ color: '#8ab4f8', lineWidth: 1 });
-    rsiSeries.createPriceLine({ price: 70, color: '#ff5c5c', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '70' });
-    rsiSeries.createPriceLine({ price: 30, color: '#3ddc84', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '30' });
+    const rsiSeries = rsiChart.addLineSeries({ color: '#4f5bff', lineWidth: 1 });
+    rsiSeries.createPriceLine({ price: 70, color: '#ef4444', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '70' });
+    rsiSeries.createPriceLine({ price: 30, color: '#16a34a', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '30' });
 
     const macdChart = LightweightCharts.createChart(document.getElementById('macd-chart'), {
-      layout: { background: { color: '#12161f' }, textColor: '#c3cad6' },
-      grid: { vertLines: { color: '#1c2130' }, horzLines: { color: '#1c2130' } },
-      rightPriceScale: { borderColor: '#232838' },
-      timeScale: { borderColor: '#232838', timeVisible: true, visible: false },
-      height: 100,
+      layout: { background: { color: '#ffffff' }, textColor: '#6b7280' },
+      grid: { vertLines: { color: '#eef0f5' }, horzLines: { color: '#eef0f5' } },
+      rightPriceScale: { borderColor: '#e8eaf1' },
+      timeScale: { borderColor: '#e8eaf1', timeVisible: true, visible: false },
+      autoSize: true,
     });
     const macdSeries = macdChart.addHistogramSeries({ priceFormat: { type: 'price', precision: 2 } });
 
@@ -433,16 +663,50 @@ _PAGE = """
     });
     chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.05, bottom: 0.28 } });
     const candleSeries = chart.addCandlestickSeries({
-      upColor: '#3ddc84', downColor: '#ff5c5c', borderVisible: false,
-      wickUpColor: '#3ddc84', wickDownColor: '#ff5c5c',
+      upColor: '#16a34a', downColor: '#ef4444', borderVisible: false,
+      wickUpColor: '#16a34a', wickDownColor: '#ef4444',
     });
     const volumeSeries = chart.addHistogramSeries({
       priceFormat: { type: 'volume' },
       priceScaleId: 'volume',
     });
     chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
-    const liveSeries = chart.addLineSeries({ color: '#e0b96b', lineWidth: 1 });
+    const liveSeries = chart.addLineSeries({ color: '#d97706', lineWidth: 1 });
     let forecastSeries = null, forecastUpper = null, forecastLower = null;
+
+    // --- Theme toggle ----------------------------------------------------------
+    function applyChartTheme(isDark) {
+      const bg = isDark ? '#12161f' : '#ffffff';
+      const text = isDark ? '#9aa4b2' : '#6b7280';
+      const grid = isDark ? '#1c2130' : '#eef0f5';
+      const border = isDark ? '#232838' : '#e8eaf1';
+      [chart, rsiChart, macdChart].forEach((c) => {
+        c.applyOptions({
+          layout: { background: { color: bg }, textColor: text },
+          grid: { vertLines: { color: grid }, horzLines: { color: grid } },
+          rightPriceScale: { borderColor: border },
+          timeScale: { borderColor: border },
+        });
+      });
+    }
+
+    function setTheme(isDark) {
+      document.documentElement.dataset.theme = isDark ? 'dark' : 'light';
+      document.getElementById('theme-toggle-btn').textContent = isDark ? 'Light mode' : 'Dark mode';
+      applyChartTheme(isDark);
+      try { localStorage.setItem('theme', isDark ? 'dark' : 'light'); } catch (e) {}
+    }
+
+    document.getElementById('theme-toggle-btn').addEventListener('click', () => {
+      setTheme(document.documentElement.dataset.theme !== 'dark');
+    });
+
+    (function initTheme() {
+      let saved = null;
+      try { saved = localStorage.getItem('theme'); } catch (e) {}
+      const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      setTheme(saved ? saved === 'dark' : prefersDark);
+    })();
 
     function clearForecastSeries() {
       [forecastSeries, forecastUpper, forecastLower].forEach(s => { if (s) chart.removeSeries(s); });
@@ -463,35 +727,134 @@ _PAGE = """
       if (j.volume) volumeSeries.setData(j.volume);
       if (ind.rsi) rsiSeries.setData(ind.rsi);
       if (ind.macd_hist) macdSeries.setData(ind.macd_hist);
-      document.getElementById('last-price').textContent = COINS[currentSymbol] + ' — loading...';
+      document.getElementById('crumb-coin').textContent = COINS[currentSymbol] || currentSymbol;
+      const skel = document.getElementById('chart-skel');
+      if (skel) skel.remove();
     }
 
-    document.getElementById('coin-select').addEventListener('change', (e) => {
-      currentSymbol = e.target.value;
+    function selectSymbol(symbol) {
+      if (symbol === currentSymbol) return;
+      currentSymbol = symbol;
+      document.getElementById('coin-select').value = symbol;
       loadHistory();
       refreshSignal();
       refreshEntry();
       document.getElementById('forecast-out').innerHTML = '';
-    });
+      lastForecast = null;
+      renderMarkets();
+      renderMiniCoins();
+      renderChartHeaderStats();
+      runForecast();
+      runBacktest();
+    }
 
-    document.getElementById('tf-select').addEventListener('change', (e) => {
-      currentTimeframe = e.target.value;
-      loadHistory();
+    document.getElementById('coin-select').addEventListener('change', (e) => selectSymbol(e.target.value));
+
+    function setForecastHorizonLabel() {
+      document.getElementById('forecast-horizon-label').textContent = currentTimeOpt.horizon;
+    }
+
+    document.querySelectorAll('.tf-tab').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tf-tab').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentTimeOpt = TIME_OPTIONS.find(o => o.key === btn.dataset.key);
+        currentTimeframe = currentTimeOpt.timeframe;
+        loadHistory();
+        setForecastHorizonLabel();
+        document.getElementById('forecast-out').innerHTML = '';
+        lastForecast = null;
+        runForecast();
+      });
+    });
+    setForecastHorizonLabel();
+
+    // --- Side panel tabs -----------------------------------------------------
+    document.querySelectorAll('.side-tab').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.side-tab').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        document.querySelector('.tab-panel[data-panel="' + btn.dataset.tab + '"]').classList.add('active');
+      });
     });
 
     // --- Realtime price via websocket ---------------------------------------
     const socket = io();
-    socket.on('connect', () => document.getElementById('live-dot').classList.remove('off'));
-    socket.on('disconnect', () => document.getElementById('live-dot').classList.add('off'));
+    socket.on('connect', () => {
+      document.getElementById('live-dot').classList.remove('off');
+      document.getElementById('live-pill').title = 'Live';
+    });
+    socket.on('disconnect', () => {
+      document.getElementById('live-dot').classList.add('off');
+      document.getElementById('live-pill').title = 'Offline';
+    });
+
+    const coinTickers = {};   // symbol -> latest {price, change_pct, high, low, quote_volume}
     let lastLivePrice = null;
+
+    function fmtPrice(p) { return p.toLocaleString(undefined, { maximumFractionDigits: p < 10 ? 6 : 2 }); }
+    function fmtChangeSpan(pct) {
+      if (pct === null || pct === undefined) return '<span class="placeholder">—</span>';
+      const cls = pct >= 0 ? 'pos' : 'neg';
+      return '<span class="' + cls + '">' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%</span>';
+    }
+
+    function renderChartHeaderStats() {
+      const t = coinTickers[currentSymbol];
+      if (!t) return;
+      document.getElementById('chart-price-big').textContent = '$' + fmtPrice(t.price);
+      document.getElementById('stat-change').innerHTML = fmtChangeSpan(t.change_pct);
+      document.getElementById('stat-high').textContent = t.high !== null && t.high !== undefined ? fmtPrice(t.high) : '—';
+      document.getElementById('stat-low').textContent = t.low !== null && t.low !== undefined ? fmtPrice(t.low) : '—';
+      document.getElementById('stat-vol').textContent = t.quote_volume ? '$' + Math.round(t.quote_volume).toLocaleString() : '—';
+    }
+
+    function renderMiniCoins() {
+      const symbols = Object.keys(COINS).filter(s => s !== currentSymbol).slice(0, 3);
+      symbols.forEach((sym, i) => {
+        const el = document.getElementById('mini-coin-' + i);
+        if (!el) return;
+        const t = coinTickers[sym];
+        el.onclick = () => selectSymbol(sym);
+        el.innerHTML =
+          '<div class="row"><span class="coin-badge">' + COINS[sym][0] + '</span>' +
+            '<span class="pair">' + sym + '</span></div>' +
+          '<div class="name">' + COINS[sym] + '</div>' +
+          (t
+            ? '<div class="price">$' + fmtPrice(t.price) + '</div>' +
+              '<div class="meta" style="margin:0.2rem 0 0">' + fmtChangeSpan(t.change_pct) + '</div>'
+            : '<span class="skel skel-line medium" style="height:1.1rem;margin:0 0 0.3rem"></span>' +
+              '<span class="skel skel-line short" style="height:0.7rem;margin:0"></span>');
+      });
+    }
+
+    function renderMarkets() {
+      const tbody = document.getElementById('markets-body');
+      tbody.innerHTML = Object.keys(COINS).map((sym) => {
+        const t = coinTickers[sym];
+        const active = sym === currentSymbol ? ' active' : '';
+        return '<tr class="mkt-row' + active + '" onclick="selectSymbol(\\'' + sym + '\\')">' +
+          '<td><span class="coin-badge" style="margin-right:0.5rem">' + COINS[sym][0] + '</span>' + COINS[sym] +
+            ' <span class="meta" style="display:inline;margin:0">' + sym + '</span></td>' +
+          '<td>' + (t ? '$' + fmtPrice(t.price) : '<span class="skel skel-line short" style="height:0.9rem;margin:0"></span>') + '</td>' +
+          '<td>' + (t ? fmtChangeSpan(t.change_pct) : '<span class="skel skel-line short" style="height:0.9rem;margin:0"></span>') + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+    renderMarkets();
+
     socket.on('price', (msg) => {
+      coinTickers[msg.symbol] = msg;
+      renderMiniCoins();
+      renderMarkets();
       if (msg.symbol !== currentSymbol) return;
       lastLivePrice = msg.price;
       liveSeries.update({ time: Math.floor(msg.ts), value: msg.price });
-      document.getElementById('last-price').textContent =
-        COINS[currentSymbol] + ' — ' + msg.price.toLocaleString(undefined, { maximumFractionDigits: 4 });
+      renderChartHeaderStats();
       renderPosition();
     });
+
     socket.on('signal', (msg) => {
       if (msg.symbol === currentSymbol) { renderSignal(msg); refreshEntry(); }
     });
@@ -545,12 +908,30 @@ _PAGE = """
     // --- Position calculator -------------------------------------------------
     function renderPosition() {
       const out = document.getElementById('position-out');
+      const summary = document.getElementById('position-summary');
       const amount = parseFloat(document.getElementById('amount-input').value);
-      if (!amount || amount <= 0) { out.innerHTML = '<span class="placeholder">Enter an amount to size the current entry.</span>'; return; }
-      if (!lastEntry || lastEntry.entry_price === undefined) { out.innerHTML = '<span class="placeholder">Waiting for a price...</span>'; return; }
+      if (!amount || amount <= 0) {
+        out.innerHTML = '<span class="placeholder">Enter an amount to size the current entry.</span>';
+        summary.textContent = 'Enter an amount to size the current entry.';
+        return;
+      }
+      if (!lastEntry || lastEntry.entry_price === undefined) {
+        out.innerHTML = '<span class="placeholder">Waiting for a price...</span>';
+        summary.textContent = 'Waiting for a price...';
+        return;
+      }
 
       const qty = amount / lastEntry.entry_price;
       const hasEntry = lastEntry.verdict === 'ENTRY_LONG' || lastEntry.verdict === 'ENTRY_SHORT';
+
+      if (lastLivePrice !== null) {
+        const move = lastEntry.direction === 'SELL' ? (lastEntry.entry_price - lastLivePrice) : (lastLivePrice - lastEntry.entry_price);
+        const pnlUsd = qty * move;
+        summary.innerHTML = qty.toFixed(6) + ' ' + currentSymbol.split('/')[0] + ' &middot; unrealized ' +
+          (pnlUsd >= 0 ? '+' : '') + '$' + pnlUsd.toFixed(2);
+      } else {
+        summary.textContent = qty.toFixed(6) + ' ' + currentSymbol.split('/')[0];
+      }
 
       let html = '<div class="stat-grid">' +
         '<div class="stat"><div class="label">Quantity @ ' + lastEntry.entry_price.toFixed(4) + '</div><div class="value neutral">' + qty.toFixed(6) + '</div></div>';
@@ -610,10 +991,10 @@ _PAGE = """
     // --- Forecast --------------------------------------------------------------
     async function runForecast() {
       const btn = document.getElementById('forecast-btn');
-      const horizon = document.getElementById('horizon-select').value;
+      const horizon = currentTimeOpt.horizon;
       btn.disabled = true;
       document.getElementById('forecast-out').innerHTML =
-        '<div class="placeholder" style="margin-top:1rem">Fitting Prophet model on daily history, may take ~10-30s...</div>';
+        '<div class="placeholder" style="margin-top:1rem">Fitting Prophet model, may take ~10-30s...</div>';
       await fetch('/api/forecast?symbol=' + encodeURIComponent(currentSymbol) + '&horizon=' + horizon, { method: 'POST' });
       pollForecast(currentSymbol, horizon);
     }
@@ -676,7 +1057,64 @@ _PAGE = """
       const j = await r.json();
       if (j.running) { setTimeout(() => pollForecast(symbol, horizon), 2000); return; }
       if (!j.result) { document.getElementById('forecast-btn').disabled = false; return; }
-      if (symbol === currentSymbol) { renderForecast(j.result); refreshEntry(); }
+      if (symbol === currentSymbol && horizon === currentTimeOpt.horizon) { renderForecast(j.result); refreshEntry(); }
+    }
+
+    // --- Best time to invest (scans every horizon) --------------------------
+    async function runBestTime() {
+      const btn = document.getElementById('best-time-btn');
+      btn.disabled = true;
+      document.getElementById('best-time-out').innerHTML =
+        '<div class="placeholder">Fitting Prophet across every horizon (15m → 1Y), one at a time — this can take a few minutes...</div>';
+      await fetch('/api/best_time?symbol=' + encodeURIComponent(currentSymbol), { method: 'POST' });
+      pollBestTime(currentSymbol);
+    }
+
+    function renderBestTime(r) {
+      document.getElementById('best-time-btn').disabled = false;
+      const out = document.getElementById('best-time-out');
+      if (r.error) { out.innerHTML = '<div class="verdict"><b>Error:</b> ' + r.error + '</div>'; return; }
+      if (!r.best) { out.innerHTML = '<span class="placeholder">No horizon produced a usable forecast.</span>'; return; }
+
+      const b = r.best;
+      const bDir = b.projected_change_pct >= 0 ? 'pos' : 'neg';
+      const bLabel = TIME_OPTIONS.find(o => o.horizon === b.horizon);
+
+      let html = '<div class="verdict good">Best signal-to-noise: <b>' + (bLabel ? bLabel.label : b.horizon) + '</b> — ' +
+        '<span class="' + bDir + '">' + (b.projected_change_pct >= 0 ? '+' : '') + b.projected_change_pct.toFixed(2) + '%</span> projected, ' +
+        '±' + b.uncertainty_band_pct.toFixed(2) + '% band (score ' + b.score.toFixed(2) + ').</div>';
+
+      html += '<div class="stat-grid" style="margin-top:0.75rem">';
+      for (const row of r.ranked) {
+        const opt = TIME_OPTIONS.find(o => o.horizon === row.horizon);
+        const cls = row.projected_change_pct >= 0 ? 'pos' : 'neg';
+        html += '<div class="stat" style="cursor:pointer" onclick="jumpToHorizon(\\'' + row.horizon + '\\')">' +
+          '<div class="label">' + (opt ? opt.label : row.horizon) + '</div>' +
+          '<div class="value ' + cls + '">' + (row.projected_change_pct >= 0 ? '+' : '') + row.projected_change_pct.toFixed(2) + '%</div>' +
+          '<div class="meta" style="margin:0">score ' + row.score.toFixed(2) + '</div>' +
+        '</div>';
+      }
+      html += '</div>';
+      if (r.errors && r.errors.length) {
+        html += '<div class="placeholder" style="margin-top:0.6rem">' + r.errors.length + ' horizon(s) failed (usually not enough history yet).</div>';
+      }
+      out.innerHTML = html;
+    }
+
+    function jumpToHorizon(horizon) {
+      const opt = TIME_OPTIONS.find(o => o.horizon === horizon);
+      if (!opt) return;
+      const tab = document.querySelector('.tf-tab[data-key="' + opt.key + '"]');
+      if (tab) tab.click();
+      runForecast();
+    }
+
+    async function pollBestTime(symbol) {
+      const r = await fetch('/api/best_time?symbol=' + encodeURIComponent(symbol));
+      const j = await r.json();
+      if (j.running) { setTimeout(() => pollBestTime(symbol), 3000); return; }
+      if (!j.result) { document.getElementById('best-time-btn').disabled = false; return; }
+      if (symbol === currentSymbol) renderBestTime(j.result);
     }
 
     // --- Backtest ----------------------------------------------------------
@@ -729,7 +1167,7 @@ _PAGE = """
       if (!r.n_trades) { wrap.innerHTML = '<span class="placeholder">No trades in this backtest window.</span>'; return; }
       const wins = Math.round(r.n_trades * r.win_rate / 100);
       const losses = r.n_trades - wins;
-      wrap.innerHTML = '<canvas id="backtest-donut" height="160"></canvas>';
+      wrap.innerHTML = '<div style="position:relative; height:220px; max-width:320px; margin:0 auto"><canvas id="backtest-donut"></canvas></div>';
       if (backtestChart) backtestChart.destroy();
       backtestChart = new Chart(document.getElementById('backtest-donut'), {
         type: 'doughnut',
@@ -738,6 +1176,8 @@ _PAGE = """
           datasets: [{ data: [wins, losses], backgroundColor: ['#3ddc84', '#ff5c5c'], borderWidth: 0 }],
         },
         options: {
+          responsive: true,
+          maintainAspectRatio: false,
           plugins: { legend: { position: 'bottom', labels: { color: '#c3cad6' } } },
           cutout: '65%',
         },
@@ -755,6 +1195,9 @@ _PAGE = """
     loadHistory();
     refreshSignal();
     refreshEntry();
+    renderMiniCoins();
+    runForecast();
+    runBacktest();
     setInterval(refreshSignal, 15000);
     setInterval(refreshEntry, 15000);
   </script>
@@ -771,10 +1214,10 @@ def index():
         exchange=config.EXCHANGE_ID,
         coins=config.COINS,
         coins_json=json.dumps(config.COINS),
-        horizons=list(config.FORECAST_HORIZONS.keys()),
         backtest_candles=config.BACKTEST_CANDLES,
-        chart_timeframes=config.CHART_TIMEFRAMES,
-        default_timeframe=config.CHART_TIMEFRAME,
+        time_options=config.TIME_OPTIONS,
+        time_options_json=json.dumps(config.TIME_OPTIONS),
+        default_time_key=next((o["key"] for o in config.TIME_OPTIONS if o["timeframe"] == config.CHART_TIMEFRAME), config.TIME_OPTIONS[0]["key"]),
     )
 
 
@@ -866,6 +1309,15 @@ def api_forecast():
         _run_forecast_async(symbol, horizon)
     with _lock:
         return jsonify(_forecast_cache.get(key, {"running": False, "result": None}))
+
+
+@app.route("/api/best_time", methods=["GET", "POST"])
+def api_best_time():
+    symbol = request.args.get("symbol", config.SYMBOL)
+    if request.method == "POST":
+        _run_best_time_async(symbol)
+    with _lock:
+        return jsonify(_best_time_cache.get(symbol, {"running": False, "result": None}))
 
 
 if __name__ == "__main__":
