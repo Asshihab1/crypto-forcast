@@ -243,6 +243,7 @@ _PAGE = """
   <title>Crypto Analysis Bot</title>
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
@@ -253,7 +254,7 @@ _PAGE = """
     .layout { display:grid; grid-template-columns: minmax(0, 2.2fr) minmax(280px, 1fr); gap:1.25rem; align-items:start; }
     @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
     .col { min-width:0; }
-    h1 { font-size:1.1rem; font-weight:600; color:#9aa4b2; letter-spacing:0.02em; margin-bottom:1.25rem; }
+    h1 { font-size:1.25rem; font-weight:600; color:#e6e6e6; margin-bottom:1.25rem; }
     .buy { color:#3ddc84; } .sell { color:#ff5c5c; } .hold { color:#c9c9c9; }
     .card {
       background:#12161f; border:1px solid #232838; border-radius:12px;
@@ -274,7 +275,7 @@ _PAGE = """
     .live-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3ddc84; margin-right:0.4rem; }
     .live-dot.off { background:#5a6472; }
     #chart { width:100%; height:380px; }
-    .section-title { font-size:0.8rem; text-transform:uppercase; letter-spacing:0.06em; color:#7d8797; margin-bottom:0.9rem; }
+    .section-title { font-size:0.95rem; font-weight:600; color:#c3cad6; margin-bottom:0.9rem; }
     .stat-grid {
       display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));
       gap:0.75rem; margin-top:1rem;
@@ -282,7 +283,7 @@ _PAGE = """
     .stat {
       background:#0e131c; border:1px solid #1f2432; border-radius:10px; padding:0.85rem 1rem;
     }
-    .stat .label { font-size:0.72rem; text-transform:uppercase; letter-spacing:0.05em; color:#6b7482; margin-bottom:0.35rem; }
+    .stat .label { font-size:0.78rem; color:#8891a0; margin-bottom:0.35rem; }
     .stat .value { font-size:1.25rem; font-weight:600; }
     .pos { color:#3ddc84; } .neg { color:#ff5c5c; } .neutral { color:#e6e6e6; }
     .verdict {
@@ -311,7 +312,7 @@ _PAGE = """
     .entry-card.entry-short { border-color:#3d1f1f; background:#1a1212; }
     .entry-card.entry-avoid { border-color:#3d1f1f; background:#1a1212; }
     .entry-card.entry-wait { border-color:#2d3340; }
-    .entry-badge { display:inline-block; padding:0.3rem 0.8rem; border-radius:6px; font-weight:700; font-size:1rem; letter-spacing:0.03em; }
+    .entry-badge { display:inline-block; padding:0.3rem 0.8rem; border-radius:6px; font-weight:700; font-size:1rem; }
     .entry-badge.entry-long { background:#1e3d2f; color:#5fd99a; }
     .entry-badge.entry-short { background:#3d1f1f; color:#ff8f8f; }
     .entry-badge.entry-avoid { background:#3d1f1f; color:#ff8f8f; }
@@ -324,7 +325,7 @@ _PAGE = """
       gap:0.75rem; margin:0.9rem 0;
     }
     .segment { background:#0e131c; border:1px solid #1f2432; border-radius:10px; padding:0.85rem 1rem; }
-    .segment .label { font-size:0.72rem; text-transform:uppercase; letter-spacing:0.05em; color:#6b7482; margin-bottom:0.35rem; }
+    .segment .label { font-size:0.78rem; color:#8891a0; margin-bottom:0.35rem; }
     .segment .value { font-size:1.15rem; font-weight:600; }
     .dir-up { color:#3ddc84; } .dir-down { color:#ff5c5c; } .dir-flat { color:#c9c9c9; }
   </style>
@@ -343,6 +344,7 @@ _PAGE = """
       <option value="{{ tf }}" {% if tf == default_timeframe %}selected{% endif %}>{{ tf }}</option>
       {% endfor %}
     </select>
+    <input id="amount-input" type="number" min="0" step="any" placeholder="Investment amount ($)" style="width:180px">
     <span id="last-price" class="meta"></span>
   </div>
 
@@ -358,10 +360,12 @@ _PAGE = """
 
       <div class="card">
         <div class="section-title">Position calculator</div>
-        <div class="toolbar">
-          <input id="amount-input" type="number" min="0" step="any" placeholder="Investment amount ($)">
-        </div>
-        <div id="position-out"><span class="placeholder">Enter an amount to size the current entry.</span></div>
+        <div id="position-out"><span class="placeholder">Enter an amount above to size the current entry.</span></div>
+      </div>
+
+      <div class="card">
+        <div class="section-title">Backtest outcome</div>
+        <div id="backtest-donut-wrap"><span class="placeholder">Run a backtest to see the win/loss split.</span></div>
       </div>
     </div>
 
@@ -576,6 +580,7 @@ _PAGE = """
 
     document.getElementById('amount-input').addEventListener('input', () => {
       renderPosition();
+      if (lastForecast && !lastForecast.error) renderForecast(lastForecast);
       try { localStorage.setItem('investAmount', document.getElementById('amount-input').value); } catch (e) {}
     });
     try {
@@ -613,7 +618,9 @@ _PAGE = """
       pollForecast(currentSymbol, horizon);
     }
 
+    let lastForecast = null;
     function renderForecast(r) {
+      lastForecast = r;
       const btn = document.getElementById('forecast-btn');
       btn.disabled = false;
       const out = document.getElementById('forecast-out');
@@ -631,6 +638,14 @@ _PAGE = """
       const fd = r.fit_details || {};
       const seasTag = (on) => '<span class="seasonality-tag ' + (on ? 'on' : 'off') + '">' + (on ? 'on' : 'off') + '</span>';
 
+      const amount = parseFloat(document.getElementById('amount-input').value);
+      let amountTile = '';
+      if (amount > 0) {
+        const projectedValue = amount * (1 + r.projected_change_pct / 100);
+        amountTile = '<div class="stat"><div class="label">$' + amount.toFixed(2) + ' becomes</div><div class="value ' + dir + '">' +
+          '$' + projectedValue.toFixed(2) + '</div></div>';
+      }
+
       out.innerHTML = '<div class="stat-grid">' +
         '<div class="stat"><div class="label">Last price</div><div class="value neutral">' + r.last_price.toFixed(2) + '</div></div>' +
         '<div class="stat"><div class="label">Horizon</div><div class="value neutral">' + r.periods + ' x ' + r.timeframe + '</div></div>' +
@@ -638,6 +653,7 @@ _PAGE = """
           (r.projected_change_pct >= 0 ? '+' : '') + r.projected_change_pct.toFixed(2) + '%</div></div>' +
         '<div class="stat"><div class="label">Uncertainty band</div><div class="value neutral">±' +
           (fd.uncertainty_band_pct_of_price / 2).toFixed(2) + '%</div></div>' +
+        amountTile +
         '</div>' +
         '<div class="verdict">Statistical trend projection only (Facebook Prophet) — ' +
         'not aware of news or regime change. The shaded band (widening further out) is the honest part of this output, ' +
@@ -704,6 +720,28 @@ _PAGE = """
         '</div>';
 
       out.innerHTML = html;
+      renderBacktestDonut(r);
+    }
+
+    let backtestChart = null;
+    function renderBacktestDonut(r) {
+      const wrap = document.getElementById('backtest-donut-wrap');
+      if (!r.n_trades) { wrap.innerHTML = '<span class="placeholder">No trades in this backtest window.</span>'; return; }
+      const wins = Math.round(r.n_trades * r.win_rate / 100);
+      const losses = r.n_trades - wins;
+      wrap.innerHTML = '<canvas id="backtest-donut" height="160"></canvas>';
+      if (backtestChart) backtestChart.destroy();
+      backtestChart = new Chart(document.getElementById('backtest-donut'), {
+        type: 'doughnut',
+        data: {
+          labels: ['Wins (' + wins + ')', 'Losses (' + losses + ')'],
+          datasets: [{ data: [wins, losses], backgroundColor: ['#3ddc84', '#ff5c5c'], borderWidth: 0 }],
+        },
+        options: {
+          plugins: { legend: { position: 'bottom', labels: { color: '#c3cad6' } } },
+          cutout: '65%',
+        },
+      });
     }
 
     async function pollBacktest(symbol) {
