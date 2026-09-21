@@ -18,7 +18,8 @@ Quotex / binary options" note at the bottom for the reasoning.
 | `backtester.py` | Walks the signal engine over history with real fees/slippage and reports honest win rate, expectancy, drawdown. |
 | `bot.py` | Live loop: polls for new candles, prints/alerts a signal. No auto-trading. |
 | `alerts.py` | Optional Telegram alerts (falls back to console-only). |
-| `dashboard.py` | Optional web dashboard (Flask, port 3100) — live signal + on-demand backtest in a browser. |
+| `forecast.py` | Prophet-based trend forecast (day/month/year) on daily closes — separate from the rules-based signal. |
+| `dashboard.py` | Optional web dashboard (Flask + Socket.IO, port 3100) — real-time chart per coin, live signal, on-demand backtest and Prophet forecast, in a browser. |
 
 ## Setup
 
@@ -95,9 +96,29 @@ indicators behind it, e.g.:
 python dashboard.py
 ```
 
-Serves a browser dashboard at `http://localhost:3100` — same closed-candle
-poll loop as `bot.py`, plus a button to run `backtester.py` on demand. Also
-read-only, no order placement.
+Serves a browser dashboard at `http://localhost:3100`:
+
+- **Coin picker** — pick from `config.COINS` (BTC, BNB, LTC, ETH, SOL, XRP by
+  default; add any pair your exchange lists).
+- **Real-time chart** — candlestick history plus a live price line pushed
+  over a websocket (Socket.IO), updated every `config.REALTIME_POLL_SECONDS`.
+- **Signal panel** — same closed-candle rules-based signal as `bot.py`, per
+  coin.
+- **Entry suggestion** — combines the live signal, backtest expectancy, and
+  forecast trend into one ENTRY_LONG / ENTRY_SHORT / AVOID / WAIT verdict,
+  with every input it used spelled out. Only calls an entry when the
+  near-term signal, longer-term forecast, and historical backtest
+  expectancy all agree; disagreement or missing data (backtest/forecast not
+  run yet) falls back to WAIT. Still rules on rules, not a prediction —
+  read the reasons, not just the badge.
+- **Backtest** — runs `backtester.py` for the selected coin on demand.
+- **Forecast** — runs `forecast.py` (Prophet) for day/month/year horizons on
+  demand; plots the projection and uncertainty band on the chart. This is a
+  separate, purely statistical trend extrapolation — it does not feed into
+  the BUY/SELL/HOLD signal above, and per `forecast.py`'s docstring, the
+  widening uncertainty band further out is the honest part of the output.
+
+Still read-only, no order placement.
 
 For Telegram alerts, set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
 (via a `.env` file or environment variables) — get a token from

@@ -17,6 +17,45 @@ EXCHANGE_ID = "binance"        # ccxt exchange id; e.g. "binance", "kraken", "co
 SYMBOL = "BTC/USDT"            # any pair the exchange lists, e.g. "ETH/USDT"
 TIMEFRAME = "15m"              # candle size: "1m","5m","15m","1h","4h","1d", ...
 
+# Coins selectable in the dashboard (symbol -> display label). Add any pair
+# your exchange lists — market data is public, no API key needed.
+COINS = {
+    "BTC/USDT": "Bitcoin",
+    "BNB/USDT": "BNB",
+    "LTC/USDT": "Litecoin",
+    "ETH/USDT": "Ethereum",
+    "SOL/USDT": "Solana",
+    "XRP/USDT": "XRP",
+}
+
+# --- Forecast (Prophet) -----------------------------------------------------
+# Horizon key -> which candle timeframe to fit/forecast on, how many candles
+# ahead ("periods"), the pandas frequency alias for that candle size, and how
+# much history to pull for fitting. Short intraday horizons fit on intraday
+# candles (Prophet has far less signal to work with there — treat these as
+# even less reliable than the daily/month/year horizons); day/month/year fit
+# on daily candles regardless of the live-signal TIMEFRAME above.
+FORECAST_HORIZONS = {
+    "15m":   {"timeframe": "15m", "periods": 1,   "freq": "15min", "history_candles": 2000},
+    "30m":   {"timeframe": "30m", "periods": 1,   "freq": "30min", "history_candles": 2000},
+    "4h":    {"timeframe": "4h",  "periods": 1,   "freq": "4h",    "history_candles": 1000},
+    "day":   {"timeframe": "1d",  "periods": 1,   "freq": "D",     "history_candles": 730},
+    "month": {"timeframe": "1d",  "periods": 30,  "freq": "D",     "history_candles": 730},
+    "year":  {"timeframe": "1d",  "periods": 365, "freq": "D",     "history_candles": 730},
+}
+
+# --- Entry sizing (dashboard entry-suggestion card) --------------------------
+# Stop-loss / take-profit distance from entry, in multiples of ATR (average
+# true range) — a volatility-scaled distance, not a fixed price offset.
+ATR_STOP_MULT = 1.5
+ATR_TARGET_MULT = 3.0   # 2:1 reward:risk at these defaults
+
+# --- Dashboard chart ---------------------------------------------------------
+CHART_TIMEFRAME = "1h"          # default candle size for the live dashboard chart
+CHART_TIMEFRAMES = ["15m", "30m", "1h", "4h", "1d"]   # selectable in the dashboard
+CHART_HISTORY_LIMIT = 300       # candles to load for the initial chart draw
+REALTIME_POLL_SECONDS = 5       # how often the dashboard pushes live price ticks
+
 # --- Indicator settings -----------------------------------------------------
 EMA_FAST = 9
 EMA_SLOW = 21
